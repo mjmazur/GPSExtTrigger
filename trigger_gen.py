@@ -18,39 +18,74 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 try:
     import gpiod
     HAS_GPIOD = True
+    # Detect libgpiod version: v2 has request_lines as a module-level function
+    GPIOD_V2 = hasattr(gpiod, "request_lines")
 except ImportError:
     gpiod = None
     HAS_GPIOD = False
+    GPIOD_V2 = False
     logging.warning("gpiod module not found. Running in simulation mode.")
 
-class MockLine:
-    def __init__(self, offset):
-        self.offset = offset
-        self.value = 0
-        self.direction = None
 
-    def request(self, consumer, type, flags=0):
-        logging.info(f"MockLine {self.offset}: Requested by {consumer}")
+def open_gpio_line(chip_path, line_offset, consumer="TriggerGenerator"):
+    """Open a GPIO line for output. Returns an object with set_value(0|1) and release()."""
+    if not HAS_GPIOD:
+        logging.info("GPIO simulation: chip=%s line=%d consumer=%s", chip_path, line_offset, consumer)
+        return _MockGPIOLine(line_offset)
+
+    if GPIOD_V2:
+        return _GPIOLineV2(chip_path, line_offset, consumer)
+    else:
+        return _GPIOLineV1(chip_path, line_offset, consumer)
+
+
+class _MockGPIOLine:
+    """Simulated GPIO line for testing on non-RPi systems."""
+    def __init__(self, offset):
+        self._offset = offset
 
     def set_value(self, value):
-        self.value = value
-        # logging.debug(f"MockLine {self.offset}: Set to {value}")
+        pass
 
     def release(self):
-        logging.info(f"MockLine {self.offset}: Released")
+        logging.info("MockGPIO line %d released.", self._offset)
 
-class MockChip:
-    def __init__(self, path):
-        self.path = path
 
-    def get_line(self, offset):
-        return MockLine(offset)
+class _GPIOLineV1:
+    """Wrapper for libgpiod v1 (chip.get_line / line.request / line.set_value)."""
+    def __init__(self, chip_path, offset, consumer):
+        self._chip = gpiod.Chip(chip_path)
+        self._line = self._chip.get_line(offset)
+        self._line.request(consumer=consumer, type=gpiod.LINE_REQ_DIR_OUT)
+        logging.info("GPIO opened (libgpiod v1): %s line %d", chip_path, offset)
 
-    def __enter__(self):
-        return self
+    def set_value(self, value):
+        self._line.set_value(value)
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        pass
+    def release(self):
+        self._line.release()
+
+
+class _GPIOLineV2:
+    """Wrapper for libgpiod v2 (gpiod.request_lines / request.set_value)."""
+    def __init__(self, chip_path, offset, consumer):
+        from gpiod.line import Direction, Value
+        self._offset = offset
+        self._Value = Value
+        self._request = gpiod.request_lines(
+            path=chip_path,
+            consumer=consumer,
+            config={offset: gpiod.LineSettings(direction=Direction.OUTPUT,
+                                               output_value=Value.INACTIVE)},
+        )
+        logging.info("GPIO opened (libgpiod v2): %s line %d", chip_path, offset)
+
+    def set_value(self, value):
+        self._request.set_value(self._offset,
+                                self._Value.ACTIVE if value else self._Value.INACTIVE)
+
+    def release(self):
+        self._request.release()
 
 
 class LEDBlinker:
@@ -446,7 +481,6 @@ class TriggerGenerator:
             logging.info("Running indefinitely (press Ctrl+C to stop)")
 
         # GPIO Setup
-        chip = None
         line = None
         count = 0
         start_perf = self._perf_counter()
@@ -454,14 +488,7 @@ class TriggerGenerator:
         led = LEDBlinker()
 
         try:
-            if HAS_GPIOD:
-                chip = gpiod.Chip(self.chip_path)
-                line = chip.get_line(self.line_offset)
-                line.request(consumer="TriggerGenerator", type=gpiod.LINE_REQ_DIR_OUT)
-            else:
-                chip = MockChip(self.chip_path)
-                line = chip.get_line(self.line_offset)
-                line.request("TriggerGenerator", None)
+            line = open_gpio_line(self.chip_path, self.line_offset)
 
             self.running = True
             self._open_jitter_csv()
