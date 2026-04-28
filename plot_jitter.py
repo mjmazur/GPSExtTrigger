@@ -98,9 +98,22 @@ def plot(data, stats=None, out_path=None):
 
         mean_val = np.nanmean(vals)
         std_val  = np.nanstd(vals)
+        min_val  = np.nanmin(vals)
+        max_val  = np.nanmax(vals)
+        n_val    = int(np.sum(valid))
         ax_ts.axhline(mean_val, color=colour, linestyle="--", linewidth=0.8, alpha=0.6)
         ax_ts.axhspan(mean_val - std_val, mean_val + std_val,
                        color=colour, alpha=0.07)
+
+        # Per-subplot statistics annotation
+        stat_str = (f"μ={mean_val:.2f}  σ={std_val:.2f}\n"
+                    f"min={min_val:.2f}  max={max_val:.2f}\n"
+                    f"n={n_val}")
+        ax_ts.text(0.98, 0.96, stat_str, transform=ax_ts.transAxes,
+                   fontsize=7.5, fontfamily="monospace",
+                   verticalalignment="top", horizontalalignment="right",
+                   bbox=dict(boxstyle="round,pad=0.4", facecolor="white",
+                             edgecolor=colour, alpha=0.85))
 
         ax_ts.set_ylabel(f"{label} (µs)")
         ax_ts.xaxis.set_minor_locator(AutoMinorLocator())
