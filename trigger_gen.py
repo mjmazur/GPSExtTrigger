@@ -5,6 +5,9 @@ import sys
 import signal
 import logging
 import csv
+import json
+import threading
+import os
 from datetime import datetime, timedelta
 import math
 
@@ -48,6 +51,93 @@ class MockChip:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         pass
+
+
+class LEDBlinker:
+    """Blinks the on-board LED (if available) at a 1-second interval via sysfs."""
+
+    # Common sysfs LED paths on Raspberry Pi (ACT / led0)
+    _CANDIDATE_PATHS = [
+        "/sys/class/leds/ACT",
+        "/sys/class/leds/led0",
+    ]
+
+    def __init__(self):
+        self._led_path = None
+        self._original_trigger = None
+        self._thread = None
+        self._stop_event = threading.Event()
+
+        for path in self._CANDIDATE_PATHS:
+            if os.path.isdir(path):
+                self._led_path = path
+                break
+
+        if self._led_path is None:
+            logging.info("No on-board LED found; LED heartbeat disabled.")
+
+    @property
+    def available(self):
+        return self._led_path is not None
+
+    def start(self):
+        """Take manual control of the LED and start the blink thread."""
+        if not self.available:
+            return
+        try:
+            trigger_path = os.path.join(self._led_path, "trigger")
+            with open(trigger_path, "r") as f:
+                # The active trigger is enclosed in [brackets]
+                raw = f.read()
+                for token in raw.split():
+                    if token.startswith("[") and token.endswith("]"):
+                        self._original_trigger = token[1:-1]
+                        break
+            # Switch to manual ("none") so we can drive brightness directly
+            with open(trigger_path, "w") as f:
+                f.write("none")
+            logging.info("On-board LED heartbeat started (%s).", self._led_path)
+        except OSError as exc:
+            logging.warning("Could not take control of LED: %s", exc)
+            self._led_path = None
+            return
+
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        """Stop blinking and restore the LED to its original trigger."""
+        if self._thread is None:
+            return
+        self._stop_event.set()
+        self._thread.join(timeout=3)
+        self._thread = None
+
+        if self._led_path:
+            try:
+                # Turn the LED off
+                with open(os.path.join(self._led_path, "brightness"), "w") as f:
+                    f.write("0")
+                # Restore original trigger
+                if self._original_trigger is not None:
+                    with open(os.path.join(self._led_path, "trigger"), "w") as f:
+                        f.write(self._original_trigger)
+                    logging.info("LED trigger restored to '%s'.", self._original_trigger)
+            except OSError as exc:
+                logging.warning("Could not restore LED state: %s", exc)
+
+    def _run(self):
+        brightness_path = os.path.join(self._led_path, "brightness")
+        state = False
+        while not self._stop_event.is_set():
+            state = not state
+            try:
+                with open(brightness_path, "w") as f:
+                    f.write("1" if state else "0")
+            except OSError:
+                break
+            self._stop_event.wait(1.0)
 
 def parse_time_arg(arg):
     """Parses a time argument which can be ISO 8601 or HH:mm:ss."""
@@ -138,7 +228,8 @@ class RunningStats:
 
 class TriggerGenerator:
     def __init__(self, rate, pulse_width, chip_path, line_offset, start_time=None, stop_time=None, duration=None,
-                 spin_window_us=500.0, jitter_report_interval=5.0, jitter_csv_path=None):
+                 spin_window_us=500.0, jitter_report_interval=5.0, jitter_csv_path=None,
+                 stats_json_path=None):
         self.rate = rate
         self.period = 1.0 / rate
         self.pulse_width = pulse_width
@@ -150,6 +241,7 @@ class TriggerGenerator:
         self.spin_window = max(0.0, spin_window_us / 1_000_000.0)
         self.jitter_report_interval = max(0.0, jitter_report_interval)
         self.jitter_csv_path = jitter_csv_path
+        self.stats_json_path = stats_json_path
         self.running = False
         self._on_error_total = RunningStats()
         self._off_error_total = RunningStats()
@@ -240,6 +332,41 @@ class TriggerGenerator:
             self._jitter_csv_file = None
             self._jitter_csv_writer = None
 
+    def _write_stats_json(self, count, elapsed_s):
+        """Write final run statistics to a JSON file."""
+        if not self.stats_json_path:
+            return
+        data = {
+            "run": {
+                "rate_hz": self.rate,
+                "period_s": self.period,
+                "pulse_width_s": self.pulse_width,
+                "spin_window_us": self.spin_window * 1_000_000.0,
+                "total_cycles": count,
+                "elapsed_s": round(elapsed_s, 6),
+                "chip": self.chip_path,
+                "line_offset": self.line_offset,
+                "start_time": self.start_time.isoformat() if self.start_time else None,
+                "stop_time": self.stop_time.isoformat() if self.stop_time else None,
+            },
+            "jitter_ms": {
+                "on_error": self._on_error_total.snapshot(scale=1000.0),
+                "off_error": self._off_error_total.snapshot(scale=1000.0),
+                "period_error": self._period_error_total.snapshot(scale=1000.0),
+            },
+            "jitter_us": {
+                "on_error": self._on_error_total.snapshot(scale=1_000_000.0),
+                "off_error": self._off_error_total.snapshot(scale=1_000_000.0),
+                "period_error": self._period_error_total.snapshot(scale=1_000_000.0),
+            },
+        }
+        try:
+            with open(self.stats_json_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            logging.info("Statistics written to %s", self.stats_json_path)
+        except OSError as exc:
+            logging.error("Failed to write stats JSON: %s", exc)
+
     def _format_stats(self, stats):
         if not stats:
             return "n/a"
@@ -321,6 +448,10 @@ class TriggerGenerator:
         # GPIO Setup
         chip = None
         line = None
+        count = 0
+        start_perf = self._perf_counter()
+
+        led = LEDBlinker()
 
         try:
             if HAS_GPIOD:
@@ -334,6 +465,7 @@ class TriggerGenerator:
 
             self.running = True
             self._open_jitter_csv()
+            led.start()
 
             epoch_ref = time.time()
             perf_ref = self._perf_counter()
@@ -414,25 +546,13 @@ class TriggerGenerator:
         except Exception as e:
             logging.error(f"Error: {e}")
         finally:
+            run_end_perf = self._perf_counter()
+            led.stop()
             self._log_jitter_stats(total=True)
+            self._write_stats_json(count, run_end_perf - start_perf)
             self._close_jitter_csv()
             if line:
                 line.release()
-            # Chip doesn't need explicit close in gpiod usually, context manager handles it if used.
-            # But gpiod.Chip is a context manager.
-            # In this structure, I instantiated it directly.
-            # In recent libgpiod (v2), API changed significantly.
-            # Assuming libgpiod v1 (common in standard repos).
-            # v1: chip.get_line(), line.request(), line.set_value()
-            # v2: request_lines() on chip.
-            # I will stick to v1 style as it's more common on RPi OS currently (bullseye/bookworm transition).
-            # Wait, Bookworm uses libgpiod v2?
-            # RPi 5 uses Bookworm. Bookworm has libgpiod 1.6.3 or 2.0?
-            # "python3-libgpiod" usually provides the bindings for the C library.
-            # If it's v2, the API is `gpiod.request_lines(...)`.
-            # If it's v1, it's `chip.get_line(...)`.
-            # I'll try to support the common interface or provide a fallback.
-            # The code above uses v1 style.
             pass
 
 def main():
@@ -450,6 +570,8 @@ def main():
                         help="Interval jitter report period in seconds, 0 disables periodic reports (default: 5)")
     parser.add_argument("--jitter-csv", type=str,
                         help="Optional path to write per-cycle jitter samples as CSV")
+    parser.add_argument("--stats-json", type=str,
+                        help="Optional path to write final run statistics as JSON")
 
     args = parser.parse_args()
 
@@ -492,6 +614,7 @@ def main():
         spin_window_us=args.spin_window_us,
         jitter_report_interval=args.jitter_report_interval,
         jitter_csv_path=args.jitter_csv,
+        stats_json_path=args.stats_json,
     )
 
     gen.run()
