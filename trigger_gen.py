@@ -8,6 +8,9 @@ import csv
 import json
 import threading
 import os
+import gc
+import ctypes
+import ctypes.util
 from datetime import datetime, timedelta
 import math
 
@@ -261,10 +264,63 @@ class RunningStats:
         self.min = float("inf")
         self.max = float("-inf")
 
+# ── Real-time helpers ──────────────────────────────────────────────────────
+
+def _setup_realtime(cpu_affinity=None, rt_priority=90):
+    """Apply real-time scheduling, memory locking, and CPU affinity.
+
+    Requires root / CAP_SYS_NICE.  Each step is attempted independently;
+    failures are logged as warnings so the script still runs.
+    """
+    applied = []
+
+    # 1. SCHED_FIFO
+    try:
+        SCHED_FIFO = 1
+        param = os.sched_param(rt_priority)
+        os.sched_setscheduler(0, SCHED_FIFO, param)
+        applied.append(f"SCHED_FIFO priority {rt_priority}")
+    except (OSError, PermissionError) as exc:
+        logging.warning("Could not set SCHED_FIFO (run as root / sudo): %s", exc)
+    except AttributeError:
+        logging.warning("os.sched_setscheduler not available on this platform.")
+
+    # 2. CPU affinity
+    if cpu_affinity is not None:
+        try:
+            os.sched_setaffinity(0, {cpu_affinity})
+            applied.append(f"CPU affinity -> core {cpu_affinity}")
+        except (OSError, PermissionError) as exc:
+            logging.warning("Could not set CPU affinity: %s", exc)
+        except AttributeError:
+            logging.warning("os.sched_setaffinity not available on this platform.")
+
+    # 3. mlockall  (MCL_CURRENT | MCL_FUTURE = 1 | 2 = 3)
+    try:
+        libc_name = ctypes.util.find_library("c")
+        if libc_name:
+            libc = ctypes.CDLL(libc_name, use_errno=True)
+            MCL_CURRENT_FUTURE = 3
+            if libc.mlockall(MCL_CURRENT_FUTURE) == 0:
+                applied.append("mlockall (MCL_CURRENT | MCL_FUTURE)")
+            else:
+                errno = ctypes.get_errno()
+                logging.warning("mlockall failed (errno %d). Run as root for memory locking.", errno)
+        else:
+            logging.warning("Could not locate libc for mlockall.")
+    except Exception as exc:
+        logging.warning("mlockall unavailable: %s", exc)
+
+    if applied:
+        logging.info("Real-time optimisations applied: %s", ", ".join(applied))
+    else:
+        logging.warning("No real-time optimisations could be applied.")
+
+
 class TriggerGenerator:
     def __init__(self, rate, pulse_width, chip_path, line_offset, start_time=None, stop_time=None, duration=None,
                  spin_window_us=500.0, jitter_report_interval=5.0, jitter_csv_path=None,
-                 stats_json_path=None):
+                 stats_json_path=None, realtime=False, cpu_affinity=None):
         self.rate = rate
         self.period = 1.0 / rate
         self.pulse_width = pulse_width
@@ -277,6 +333,8 @@ class TriggerGenerator:
         self.jitter_report_interval = max(0.0, jitter_report_interval)
         self.jitter_csv_path = jitter_csv_path
         self.stats_json_path = stats_json_path
+        self.realtime = realtime
+        self.cpu_affinity = cpu_affinity
         self.running = False
         self._on_error_total = RunningStats()
         self._off_error_total = RunningStats()
@@ -480,10 +538,22 @@ class TriggerGenerator:
         else:
             logging.info("Running indefinitely (press Ctrl+C to stop)")
 
+        # Apply real-time optimisations before entering the timing loop
+        if self.realtime:
+            _setup_realtime(cpu_affinity=self.cpu_affinity)
+        elif self.cpu_affinity is not None:
+            # Allow affinity without full RT mode
+            try:
+                os.sched_setaffinity(0, {self.cpu_affinity})
+                logging.info("CPU affinity set to core %d.", self.cpu_affinity)
+            except (OSError, AttributeError) as exc:
+                logging.warning("Could not set CPU affinity: %s", exc)
+
         # GPIO Setup
         line = None
         count = 0
         start_perf = self._perf_counter()
+        gc_was_enabled = gc.isenabled()
 
         led = LEDBlinker()
 
@@ -499,6 +569,11 @@ class TriggerGenerator:
 
             def epoch_to_perf(epoch_ts):
                 return perf_ref + (epoch_ts - epoch_ref)
+
+            # 4. Disable garbage collection during the timing-critical loop
+            if gc_was_enabled:
+                gc.disable()
+                logging.info("Garbage collection disabled for timing loop.")
 
             start_perf = epoch_to_perf(start_ts)
             end_perf = epoch_to_perf(end_ts) if end_ts is not None else None
@@ -573,6 +648,9 @@ class TriggerGenerator:
         except Exception as e:
             logging.error(f"Error: {e}")
         finally:
+            # Re-enable GC before cleanup
+            if gc_was_enabled and not gc.isenabled():
+                gc.enable()
             run_end_perf = self._perf_counter()
             led.stop()
             self._log_jitter_stats(total=True)
@@ -580,7 +658,6 @@ class TriggerGenerator:
             self._close_jitter_csv()
             if line:
                 line.release()
-            pass
 
 def main():
     parser = argparse.ArgumentParser(description="Generate a synchronized trigger signal on GPIO.")
@@ -599,6 +676,10 @@ def main():
                         help="Optional path to write per-cycle jitter samples as CSV")
     parser.add_argument("--stats-json", type=str,
                         help="Optional path to write final run statistics as JSON")
+    parser.add_argument("--realtime", action="store_true",
+                        help="Enable real-time optimisations: SCHED_FIFO, mlockall, GC disable (requires root)")
+    parser.add_argument("--cpu-affinity", type=int, default=None, metavar="CORE",
+                        help="Pin process to a specific CPU core (e.g. 3). Use with --realtime for best results.")
 
     args = parser.parse_args()
 
@@ -642,6 +723,8 @@ def main():
         jitter_report_interval=args.jitter_report_interval,
         jitter_csv_path=args.jitter_csv,
         stats_json_path=args.stats_json,
+        realtime=args.realtime,
+        cpu_affinity=args.cpu_affinity,
     )
 
     gen.run()
